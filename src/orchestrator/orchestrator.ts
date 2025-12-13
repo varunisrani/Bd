@@ -13,6 +13,36 @@ import { formatToolCall } from '../utils/tool-formatter';
 import { substituteVariables } from '../utils/variable-substitution';
 import { getAssistantClient } from '../clients/factory';
 
+// Known commands that can be used without '/' prefix (for Slack compatibility)
+const KNOWN_COMMANDS = [
+  'clone',
+  'help',
+  'status',
+  'reset',
+  'getcwd',
+  'setcwd',
+  'commands',
+  'command-set',
+  'command-invoke',
+  'load-commands',
+  'codebase-switch',
+  'repos',
+];
+
+/**
+ * Normalize message to add '/' prefix if it starts with a known command
+ * This allows Slack users to type "clone url" instead of "/clone url"
+ */
+function normalizeCommand(message: string): string {
+  const trimmed = message.trim();
+  const firstWord = trimmed.split(/\s+/)[0]?.toLowerCase();
+
+  if (firstWord && KNOWN_COMMANDS.includes(firstWord) && !trimmed.startsWith('/')) {
+    return '/' + trimmed;
+  }
+  return message;
+}
+
 export async function handleMessage(
   platform: IPlatformAdapter,
   conversationId: string,
@@ -21,6 +51,9 @@ export async function handleMessage(
 ): Promise<void> {
   try {
     console.log(`[Orchestrator] Handling message for conversation ${conversationId}`);
+
+    // Normalize command (add '/' if missing for known commands - Slack compatibility)
+    message = normalizeCommand(message);
 
     // Get or create conversation
     let conversation = await db.getOrCreateConversation(platform.getPlatformType(), conversationId);

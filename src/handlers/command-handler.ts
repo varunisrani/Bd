@@ -135,7 +135,18 @@ Session:
         return { success: false, message: 'Usage: /setcwd <path>' };
       }
       const newCwd = args.join(' ');
-      await db.updateConversation(conversation.id, { cwd: newCwd });
+
+      // Try to find and link an existing codebase for this path
+      const existingCodebase = await codebaseDb.findCodebaseByPath(newCwd);
+      if (existingCodebase) {
+        await db.updateConversation(conversation.id, {
+          cwd: newCwd,
+          codebase_id: existingCodebase.id,
+        });
+        console.log(`[Command] Auto-linked codebase ${existingCodebase.name} for path ${newCwd}`);
+      } else {
+        await db.updateConversation(conversation.id, { cwd: newCwd });
+      }
 
       // Add this directory to git safe.directory if it's a git repository
       // This prevents "dubious ownership" errors when working with existing repos
@@ -156,19 +167,38 @@ Session:
         console.log('[Command] Deactivated session after cwd change');
       }
 
+      let msg = `Working directory set to: ${newCwd}\n\nSession reset - starting fresh on next message.`;
+      if (existingCodebase) {
+        msg += `\n\nCodebase linked: ${existingCodebase.name}`;
+      }
+
       return {
         success: true,
-        message: `Working directory set to: ${newCwd}\n\nSession reset - starting fresh on next message.`,
+        message: msg,
         modified: true,
       };
     }
 
     case 'clone': {
       if (args.length === 0 || !args[0]) {
-        return { success: false, message: 'Usage: /clone <repo-url>' };
+        return { success: false, message: 'Usage: /clone <repo-url> or /clone <owner/repo>' };
       }
 
-      const repoUrl: string = args[0];
+      let repoUrl: string = args[0];
+
+      // Strip Slack URL formatting: <https://github.com/user/repo.git> -> https://github.com/user/repo.git
+      if (repoUrl.startsWith('<') && repoUrl.endsWith('>')) {
+        repoUrl = repoUrl.slice(1, -1);
+        console.log(`[Clone] Stripped Slack URL formatting: ${repoUrl}`);
+      }
+
+      // Normalize shorthand format: "user/repo" -> "https://github.com/user/repo.git"
+      // Matches: "owner/repo" but not URLs containing "://" or "github.com"
+      if (!repoUrl.includes('://') && !repoUrl.includes('github.com') && repoUrl.includes('/')) {
+        repoUrl = `https://github.com/${repoUrl}.git`;
+        console.log(`[Clone] Normalized shorthand to: ${repoUrl}`);
+      }
+
       const repoName = repoUrl.split('/').pop()?.replace('.git', '') || 'unknown';
       // Inside Docker container, always use /workspace (mounted volume)
       const workspacePath = '/workspace';
@@ -178,8 +208,8 @@ Session:
         console.log(`[Clone] Cloning ${repoUrl} to ${targetPath}`);
 
         // Build clone command with authentication if GitHub token is available
-        let cloneCommand = `git clone ${repoUrl} ${targetPath}`;
-        const ghToken = process.env.GH_TOKEN;
+        let cloneCommand = `git clone "${repoUrl}" "${targetPath}"`;
+        const ghToken = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
 
         if (ghToken && repoUrl.includes('github.com')) {
           // Inject token into GitHub URL for private repo access
@@ -195,11 +225,8 @@ Session:
               'http://github.com',
               `https://${ghToken}@github.com`
             );
-          } else if (!repoUrl.startsWith('http')) {
-            // Handle github.com/user/repo format
-            authenticatedUrl = `https://${ghToken}@${repoUrl}`;
           }
-          cloneCommand = `git clone ${authenticatedUrl} ${targetPath}`;
+          cloneCommand = `git clone "${authenticatedUrl}" "${targetPath}"`;
           console.log('[Clone] Using authenticated GitHub clone');
         }
 

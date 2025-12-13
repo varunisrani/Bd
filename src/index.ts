@@ -11,6 +11,7 @@ import express from 'express';
 import { TelegramAdapter } from './adapters/telegram';
 import { TestAdapter } from './adapters/test';
 import { GitHubAdapter } from './adapters/github';
+import { SlackAdapter } from './adapters/slack';
 import { handleMessage } from './orchestrator/orchestrator';
 import { pool } from './db/connection';
 import { ConversationLockManager } from './utils/conversation-lock';
@@ -19,11 +20,21 @@ async function main(): Promise<void> {
   console.log('[App] Starting Remote Coding Agent (Telegram + Claude MVP)');
 
   // Validate required environment variables
-  const required = ['DATABASE_URL', 'TELEGRAM_BOT_TOKEN'];
+  const required = ['DATABASE_URL'];
   const missing = required.filter(v => !process.env[v]);
   if (missing.length > 0) {
     console.error('[App] Missing required environment variables:', missing.join(', '));
     console.error('[App] Please check .env.example for required configuration');
+    process.exit(1);
+  }
+
+  // Check that at least one platform is configured
+  const hasTelegram = !!process.env.TELEGRAM_BOT_TOKEN;
+  const hasSlack = !!(process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN);
+  const hasGitHub = !!(process.env.GITHUB_TOKEN && process.env.WEBHOOK_SECRET);
+
+  if (!hasTelegram && !hasSlack && !hasGitHub) {
+    console.error('[App] No platform configured. Set at least one: TELEGRAM_BOT_TOKEN, SLACK_BOT_TOKEN+SLACK_APP_TOKEN, or GITHUB_TOKEN+WEBHOOK_SECRET');
     process.exit(1);
   }
 
@@ -68,6 +79,43 @@ async function main(): Promise<void> {
     await github.start();
   } else {
     console.log('[GitHub] Adapter not initialized (missing GITHUB_TOKEN or WEBHOOK_SECRET)');
+  }
+
+  // Initialize Slack adapter (conditional)
+  let slack: SlackAdapter | null = null;
+  if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
+    const slackStreamingMode = (process.env.SLACK_STREAMING_MODE || 'stream') as
+      | 'stream'
+      | 'batch';
+    slack = new SlackAdapter(
+      process.env.SLACK_BOT_TOKEN,
+      process.env.SLACK_APP_TOKEN,
+      slackStreamingMode
+    );
+
+    // Handle messages (both direct messages and mentions)
+    slack.getApp().message(async ({ event }) => {
+      // Filter for regular messages (not edits, deletes, etc.)
+      if (event.subtype !== undefined) return;
+
+      const conversationId = slack!.getConversationId(event);
+      const message = event.text;
+
+      if (!message) return;
+
+      // Fire-and-forget: handler returns immediately, processing happens async
+      lockManager
+        .acquireLock(conversationId, async () => {
+          await handleMessage(slack!, conversationId, message);
+        })
+        .catch(error => {
+          console.error('[Slack] Failed to process message:', error);
+        });
+    });
+
+    await slack.start();
+  } else {
+    console.log('[Slack] Adapter not initialized (missing SLACK_BOT_TOKEN or SLACK_APP_TOKEN)');
   }
 
   // Setup Express server
@@ -169,34 +217,43 @@ async function main(): Promise<void> {
     console.log(`[Express] Health check server listening on port ${port}`);
   });
 
-  // Initialize platform adapter (Telegram)
-  const streamingMode = (process.env.TELEGRAM_STREAMING_MODE || 'stream') as 'stream' | 'batch';
-  const telegram = new TelegramAdapter(process.env.TELEGRAM_BOT_TOKEN!, streamingMode);
+  // Initialize Telegram adapter (conditional)
+  let telegram: TelegramAdapter | null = null;
+  if (process.env.TELEGRAM_BOT_TOKEN) {
+    const streamingMode = (process.env.TELEGRAM_STREAMING_MODE ?? 'stream') as 'stream' | 'batch';
+    telegram = new TelegramAdapter(process.env.TELEGRAM_BOT_TOKEN, streamingMode);
 
-  // Handle text messages
-  telegram.getBot().on('text', async ctx => {
-    const conversationId = telegram.getConversationId(ctx);
-    const message = ctx.message.text;
+    // Handle text messages
+    telegram.getBot().on('text', async ctx => {
+      const conversationId = telegram!.getConversationId(ctx);
+      const message = ctx.message.text;
 
-    if (!message) return;
+      if (!message) return;
 
-    // Fire-and-forget: handler returns immediately, processing happens async
-    lockManager
-      .acquireLock(conversationId, async () => {
-        await handleMessage(telegram, conversationId, message);
-      })
-      .catch(error => {
-        console.error('[Telegram] Failed to process message:', error);
-      });
-  });
+      // Fire-and-forget: handler returns immediately, processing happens async
+      lockManager
+        .acquireLock(conversationId, async () => {
+          await handleMessage(telegram!, conversationId, message);
+        })
+        .catch(error => {
+          console.error('[Telegram] Failed to process message:', error);
+        });
+    });
 
-  // Start bot
-  await telegram.start();
+    await telegram.start();
+  } else {
+    console.log('[Telegram] Adapter not initialized (missing TELEGRAM_BOT_TOKEN)');
+  }
 
   // Graceful shutdown
   const shutdown = (): void => {
     console.log('[App] Shutting down gracefully...');
-    telegram.stop();
+    if (telegram) {
+      telegram.stop();
+    }
+    if (slack) {
+      slack.stop();
+    }
     pool.end().then(() => {
       console.log('[Database] Connection pool closed');
       process.exit(0);
@@ -207,7 +264,6 @@ async function main(): Promise<void> {
   process.once('SIGTERM', shutdown);
 
   console.log('[App] Remote Coding Agent is ready!');
-  console.log('[App] Send messages to your Telegram bot to get started');
   console.log('[App] Test endpoint available: POST http://localhost:' + port + '/test/message');
 }
 
